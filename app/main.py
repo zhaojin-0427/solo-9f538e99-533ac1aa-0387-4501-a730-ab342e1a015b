@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 
 from . import core, db
 
+from . import core, db
+
 app = FastAPI(
     title="单浮标潮位校时服务",
     description=__doc__,
@@ -54,8 +56,10 @@ class ChangedState(BaseModel):
 
 
 class BatchResult(BaseModel):
-    changed_count: int = Field(description="本次提交中时刻或状态变化的观测数")
-    changed: list[ChangedState] = Field(description="时刻或状态变化的观测")
+    changed_count: int = Field(description="本次提交中时刻或状态变化的观测总数（全量）")
+    changed: list[ChangedState] = Field(
+        description="时刻或状态变化的观测，按 obs_id 升序；受 changed_limit 限制"
+    )
 
 
 class TidePoint(BaseModel):
@@ -93,11 +97,20 @@ class ObservationDetail(BaseModel):
 # ---------------------------------------------------------------- 提交
 
 @app.post("/observations", response_model=BatchResult, summary="分批提交观测")
-def submit_observations(batch: ObservationBatch) -> BatchResult:
+def submit_observations(
+    batch: ObservationBatch,
+    changed_limit: int | None = Query(
+        default=None,
+        ge=0,
+        description="按观测 ID 升序限制返回的 changed 条数；省略返回全量，0 只返回总数",
+    ),
+) -> BatchResult:
     """写入观测原文并按当前校时点换算；同一 obs_id 重复提交会覆盖原文并重算。
 
-    响应列出本次提交中时刻或状态发生变化的观测 ID（含新观测，
+    响应列出本次提交中时刻或状态发生变化的观测（含新观测，
     以及因新观测落入同一 UTC 毫秒而被卷入/解除冲突的观测）。
+    ``changed_count`` 始终是变更总数（按全量计算），``changed`` 受
+    ``changed_limit`` 限制：省略返回全量，传 0 时为空、只看总数。
     """
     conn = db.get_conn()
     with db.lock():
@@ -105,16 +118,27 @@ def submit_observations(batch: ObservationBatch) -> BatchResult:
             ids = core.upsert_observations(
                 conn, [o.model_dump() for o in batch.observations]
             )
-            changed = core.fetch_states(conn, ids)
-    return BatchResult(changed_count=len(changed), changed=changed)
+            changed = core.fetch_states(conn, sorted(ids))
+    return BatchResult(
+        changed_count=len(ids),
+        changed=changed if changed_limit is None else changed[:changed_limit],
+    )
 
 
 @app.post("/calibrations", response_model=BatchResult, summary="分批提交校时点")
-def submit_calibrations(batch: CalibrationBatch) -> BatchResult:
+def submit_calibrations(
+    batch: CalibrationBatch,
+    changed_limit: int | None = Query(
+        default=None,
+        ge=0,
+        description="按观测 ID 升序限制返回的 changed 条数；省略返回全量，0 只返回总数",
+    ),
+) -> BatchResult:
     """写入校时点；同段同计数的新校时点替换旧值，并重算受影响观测。
 
     若合并后任一开机段内 UTC 随计数倒退，则整批拒绝（409），旧数据照常供数。
-    响应列出本次提交中时刻或状态发生变化的观测 ID。
+    响应列出本次提交中时刻或状态发生变化的观测；``changed_count`` 始终是
+    变更总数（按全量计算），``changed`` 受 ``changed_limit`` 限制。
     """
     conn = db.get_conn()
     with db.lock():
@@ -131,8 +155,11 @@ def submit_calibrations(batch: CalibrationBatch) -> BatchResult:
                         "violations": exc.violations,
                     },
                 )
-            changed = core.fetch_states(conn, ids)
-    return BatchResult(changed_count=len(changed), changed=changed)
+            changed = core.fetch_states(conn, sorted(ids))
+    return BatchResult(
+        changed_count=len(ids),
+        changed=changed if changed_limit is None else changed[:changed_limit],
+    )
 
 
 # ---------------------------------------------------------------- 查询
